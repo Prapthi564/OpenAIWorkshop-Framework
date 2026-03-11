@@ -1,28 +1,29 @@
-import json
 import logging
 from typing import Any, Dict, List
 
-from agent_framework import AgentThread, ChatAgent, MCPStreamableHTTPTool
+from agent_framework import Agent as FrameworkAgent, AgentSession, ChatOptions, MCPStreamableHTTPTool
 from agent_framework.azure import AzureOpenAIChatClient
 
-from agents.base_agent import BaseAgent
+from agents.base_agent import BaseAgent, ToolCallTrackingMixin
 
 logger = logging.getLogger(__name__)
 
 
-class Agent(BaseAgent):
+class Agent(ToolCallTrackingMixin, BaseAgent):
     """Agent Framework implementation of a single assistant loop."""
 
     def __init__(self, state_store: Dict[str, Any], session_id: str, access_token: str | None = None) -> None:
         super().__init__(state_store, session_id)
-        self._agent: ChatAgent | None = None
-        self._thread: AgentThread | None = None
+        self._agent: FrameworkAgent | None = None
+        self._session: AgentSession | None = None
         self._initialized = False
         self._access_token = access_token
         self._ws_manager = None  # WebSocket manager for streaming
         # Track conversation turn for tool call grouping - load from state store
         self._turn_key = f"{session_id}_current_turn"
         self._current_turn = state_store.get(self._turn_key, 0)
+        # Initialize tool tracking from mixin
+        self.init_tool_tracking()
 
     def set_websocket_manager(self, manager: Any) -> None:
         """Allow backend to inject WebSocket manager for streaming events."""
@@ -33,21 +34,42 @@ class Agent(BaseAgent):
         if self._initialized:
             return
 
-        if not all([self.azure_openai_key, self.azure_deployment, self.azure_openai_endpoint, self.api_version]):
+        # Check for either API key OR credential-based authentication
+        has_api_key = bool(self.azure_openai_key)
+        has_credential = bool(self.azure_credential)
+        
+        if not all([self.azure_deployment, self.azure_openai_endpoint, self.api_version]):
             raise RuntimeError(
-                "Azure OpenAI configuration is incomplete. Ensure AZURE_OPENAI_API_KEY, "
+                "Azure OpenAI configuration is incomplete. Ensure "
                 "AZURE_OPENAI_CHAT_DEPLOYMENT, AZURE_OPENAI_ENDPOINT, and AZURE_OPENAI_API_VERSION are set."
+            )
+        
+        if not has_api_key and not has_credential:
+            raise RuntimeError(
+                "Azure OpenAI authentication is not configured. Either set AZURE_OPENAI_API_KEY "
+                "or ensure managed identity is available for credential-based authentication."
             )
 
         headers = self._build_headers()
         mcp_tools = await self._maybe_create_tools(headers)
 
-        chat_client = AzureOpenAIChatClient(
-            api_key=self.azure_openai_key,
-            deployment_name=self.azure_deployment,
-            endpoint=self.azure_openai_endpoint,
-            api_version=self.api_version,
-        )
+        # Use API key if available, otherwise use credential-based authentication
+        if has_api_key:
+            chat_client = AzureOpenAIChatClient(
+                api_key=self.azure_openai_key,
+                deployment_name=self.azure_deployment,
+                endpoint=self.azure_openai_endpoint,
+                api_version=self.api_version,
+            )
+            logger.info("[AgentFramework] Using API key authentication for Azure OpenAI")
+        else:
+            chat_client = AzureOpenAIChatClient(
+                credential=self.azure_credential,
+                deployment_name=self.azure_deployment,
+                endpoint=self.azure_openai_endpoint,
+                api_version=self.api_version,
+            )
+            logger.info("[AgentFramework] Using managed identity authentication for Azure OpenAI")
 
         instructions = (
             "You are a helpful assistant. You can use multiple tools to find information and answer questions. "
@@ -58,12 +80,12 @@ class Agent(BaseAgent):
 
         tools = mcp_tools[0] if mcp_tools else None
 
-        self._agent = ChatAgent(
+        self._agent = FrameworkAgent(
+            client=chat_client,
             name="ai_assistant",
-            chat_client=chat_client,
             instructions=instructions,
             tools=tools,
-            model=self.openai_model_name,
+            default_options=ChatOptions(model_id=self.openai_model_name),
         )
 
         try:
@@ -75,9 +97,9 @@ class Agent(BaseAgent):
         await self._log_mcp_tool_details()
 
         if self.state:
-            self._thread = await self._agent.deserialize_thread(self.state)
+            self._session = AgentSession.from_dict(self.state)
         else:
-            self._thread = self._agent.get_new_thread()
+            self._session = self._agent.create_session()
 
         self._initialized = True
 
@@ -127,11 +149,16 @@ class Agent(BaseAgent):
             logger.debug("No tools returned from MCP server during inspection.")
             return
 
+    # get_tool_calls() is inherited from ToolCallTrackingMixin
+
     async def chat_async(self, prompt: str) -> str:
         await self._setup_single_agent()
 
-        if not self._agent or not self._thread:
+        if not self._agent or not self._session:
             raise RuntimeError("Agent Framework single agent failed to initialize correctly.")
+
+        # Clear tool calls from previous request (from mixin)
+        self.clear_tool_calls()
 
         # Increment turn counter for this new conversation turn and persist to state store
         self._current_turn += 1
@@ -141,9 +168,38 @@ class Agent(BaseAgent):
         if self._ws_manager:
             return await self._chat_async_streaming(prompt)
         
-        # Non-streaming path
-        response = await self._agent.run(prompt, thread=self._thread)
-        assistant_response = response.text
+        # Non-streaming path - use run with stream=True to capture tool calls
+        full_response = []
+        response_stream = self._agent.run(prompt, stream=True, session=self._session)
+        async for chunk in response_stream:
+            # Extract tool calls from contents
+            if hasattr(chunk, 'contents') and chunk.contents:
+                for content in chunk.contents:
+                    if content.type == "function_call":
+                        # Function call chunks come in pieces:
+                        # 1. First chunk has name, empty arguments
+                        # 2. Subsequent chunks have no name, partial arguments
+                        if content.name:
+                            # New function call starting - finalize previous if any
+                            self.track_function_call_start(content.name)
+                        
+                        # Accumulate arguments
+                        args_chunk = getattr(content, 'arguments', '')
+                        if args_chunk:
+                            self.track_function_call_arguments(args_chunk)
+                    
+                    elif content.type == "function_result":
+                        # Function result means the call is complete
+                        self.finalize_tool_tracking()
+            
+            # Extract text
+            if hasattr(chunk, 'text') and chunk.text:
+                full_response.append(chunk.text)
+        
+        # Finalize any remaining function call
+        self.finalize_tool_tracking()
+        
+        assistant_response = ''.join(full_response)
 
         messages = [
             {"role": "user", "content": prompt},
@@ -151,14 +207,14 @@ class Agent(BaseAgent):
         ]
         self.append_to_chat_history(messages)
 
-        new_state = await self._thread.serialize()
+        new_state = self._session.to_dict()
         self._setstate(new_state)
 
         return assistant_response
 
     async def _chat_async_streaming(self, prompt: str) -> str:
         """Handle chat with streaming support via WebSocket."""
-        if not self._agent or not self._thread:
+        if not self._agent or not self._session:
             raise RuntimeError("Agent Framework single agent failed to initialize correctly.")
 
         # Notify UI that agent started - with convention flag
@@ -171,27 +227,42 @@ class Agent(BaseAgent):
                     "show_message_in_internal_process": False,  # Convention: don't show message in left panel
                 },
             )
-
+        
         # Stream the response
         full_response = []
         
         try:
-            async for chunk in self._agent.run_stream(prompt, thread=self._thread):
+            response_stream = self._agent.run(prompt, stream=True, session=self._session)
+            async for chunk in response_stream:
                 # Process contents in the chunk
                 if hasattr(chunk, 'contents') and chunk.contents:
                     for content in chunk.contents:
-                        # Check for tool/function calls - only broadcast the tool name
+                        # Handle function calls - accumulate arguments across chunks
                         if content.type == "function_call":
-                            if self._ws_manager:
-                                await self._ws_manager.broadcast(
-                                    self.session_id,
-                                    {
-                                        "type": "tool_called",
-                                        "agent_id": "single_agent",
-                                        "tool_name": content.name,
-                                        "turn": self._current_turn,
-                                    },
-                                )
+                            if content.name:
+                                # New function call - finalize previous and start new
+                                self.track_function_call_start(content.name)
+                                
+                                # Broadcast that a tool is being called
+                                if self._ws_manager:
+                                    await self._ws_manager.broadcast(
+                                        self.session_id,
+                                        {
+                                            "type": "tool_called",
+                                            "agent_id": "single_agent",
+                                            "tool_name": content.name,
+                                            "turn": self._current_turn,
+                                        },
+                                    )
+                            
+                            # Accumulate arguments
+                            args_chunk = getattr(content, 'arguments', '')
+                            if args_chunk:
+                                self.track_function_call_arguments(args_chunk)
+                        
+                        elif content.type == "function_result":
+                            # Function completed - finalize
+                            self.finalize_tool_tracking()
                 
                 # Extract text from chunk
                 if hasattr(chunk, 'text') and chunk.text:
@@ -210,6 +281,9 @@ class Agent(BaseAgent):
         except Exception as exc:
             logger.error("[STREAMING] Error during single agent streaming: %s", exc, exc_info=True)
             raise
+        
+        # Finalize any remaining function call
+        self.finalize_tool_tracking()
 
         assistant_response = ''.join(full_response)
 
@@ -229,7 +303,7 @@ class Agent(BaseAgent):
         ]
         self.append_to_chat_history(messages)
 
-        new_state = await self._thread.serialize()
+        new_state = self._session.to_dict()
         self._setstate(new_state)
 
         return assistant_response
